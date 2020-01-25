@@ -16,7 +16,7 @@ set(NMGPU_SRC
 )
 
 ################################################################
-# Сборка библиотеки
+# Library assembly
 ################################################################
 
 enable_language("CUDA")
@@ -27,9 +27,5 @@ else()
 	add_library(${NMGPU_NAME} STATIC ${NMGPU_SRC})
 endif()
 
-target_include_directories(${NMGPU_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_include_directories(${NMGPU_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
-
-#if(NMGPU_USE_CUDA)
-#    add_definitions(-DNMGPU_USE_CUDA)
-#endif()
+target_include_directories(${NMGPU_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(${NMGPU_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/include)

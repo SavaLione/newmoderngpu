@@ -5,79 +5,23 @@ project(${NMGPU_NAME})
 
 ################################################################
 #
-#	Константы с описанием
-#
-################################################################
-
-# Логотип
-################################################################
-# new moderngpu
-################################################################
-set(NMGPU_DESCRIPTION_LOGO "new moderngpu")
-
-# Подключение описания
-set(NMGPU_DESCRIPTION_CONNECT "Подключение описания")
-
-# Подключение констант проекта
-set(NMGPU_DESCRIPTION_CONNECT_CONSTANTS "Подключение констант проекта")
-
-# Подключение параметров сборки
-set(NMGPU_DESCRIPTION_CONNECT_BUILD "Подключение параметров сборки")
-
-# Подключение параметров компилятора
-set(NMGPU_DESCRIPTION_CONNECT_COMPILER "Подключение параметров компилятора")
-
-# Подключение библиотек
-set(NMGPU_DESCRIPTION_CONNECT_LIB "Подключение библиотек")
-
-# Подключение субпроектов
-set(NMGPU_DESCRIPTION_CONNECT_SUB "Подключение субпроектов")
-
-# Подключение проверки возможностей целевой машины
-set(NMGPU_DESCRIPTION_CONNECT_OPP "Подключение проверки возможностей целевой машины")
-
-# Компиляция под Visual Studio (Windows)
-set(NMGPU_DESCRIPTION_COMPILER_VC "Компиляция под Visual Studio (Windows)")
-
-# Компиляция под MinGW (Windows)
-set(NMGPU_DESCRIPTION_COMPILER_MINGW "Компиляция под MinGW (Windows)")
-
-# Компиляция под GCC (Linux)
-set(NMGPU_DESCRIPTION_COMPILER_GCC "Компиляция под GCC (Linux)")
-
-message(STATUS "${NMGPU_DESCRIPTION_CONNECT}")
-
-# Вывод логотипа
-message(STATUS "${NMGPU_DESCRIPTION_LOGO}")
-
-################################################################
-#
 #	Константы проекта
 #
 ################################################################
 
-message(STATUS "${NMGPU_DESCRIPTION_CONNECT_CONSTANTS}")
-
-set(NMGPU_CONSTANTS 1)
-
 ################################################################
-# Параметры библиотеки
+# Library options
 ################################################################
 set(NMGPU_SHARED 0 CACHE BOOL "Shared library.")
 
-#set(NMGPU_LEVEL_OPTIMIZATION "O2" CACHE STRING "Optimization level")
-#set(NMGPU_LEVEL_OPTIMIZATION_VALUES "O0;O1;O2;O3")
-#set_property(CACHE NMGPU_LEVEL_OPTIMIZATION PROPERTY STRINGS ${NMGPU_LEVEL_OPTIMIZATION_VALUES})
-#Usage: if(NMGPU_LEVEL_OPTIMIZATION STREQUAL "O0")
-
 ################################################################
-# Названия и компиляция субпроектов
+# Names and compilation of subprojects
 ################################################################
 
-# New moderngpu
-set(NMGPU_LIBRARY 1 CACHE BOOL "New moderngpu library")
+# newmoderngpu library
+set(NMGPU_LIBRARY 1 CACHE BOOL "newmoderngpu library")
 
-# Тесты и примеры
+# Tests and Examples
 set(NMGPU_BENCHMARK 0 CACHE BOOL "benchmarks")
 set(NMGPU_EXAMPLES 0 CACHE BOOL "examples")
 
@@ -148,26 +92,21 @@ endif()
 #
 ################################################################
 
-message(STATUS ${NMGPU_DESCRIPTION_CONNECT_SUB})
-
-# Библиотека newmoderngpu
+# Library newmoderngpu
 if(NMGPU_LIBRARY)
 	add_subdirectory(src/)
-	message(STATUS "	New moderngpu ok.")
 endif()
 
 ################################################################
-#	Тесты и примеры
+#	Tests and Examples
 ################################################################
 
-# Тесты
+# Tests
 if(NMGPU_BENCHMARK)
 	add_subdirectory(benchmarks/)
-	message(STATUS "	Benchmarks ok.")
 endif()
 
-# Примеры
+# Examples
 if(NMGPU_EXAMPLES)
 	add_subdirectory(examples/)
-	message(STATUS "	Examples ok.")
 endif()
