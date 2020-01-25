@@ -61,139 +61,112 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/device/intrinsics.cuh>
 
 namespace mgpu {
 
-////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
-
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
-
-	// allocate space.
-	std::string text;
-	text.resize(len);
-
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
+// Get the difference between two pointers in bytes.
+MGPU_HOST_DEVICE ptrdiff_t PtrDiff(const void* a, const void* b) {
+	return (const byte*)b - (const byte*)a;
 }
 
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
-	}
-	return s;
+// Offset a pointer by i bytes.
+template<typename T> 
+MGPU_HOST_DEVICE const T* PtrOffset(const T* p, ptrdiff_t i) {
+	return (const T*)((const byte*)p + i);
 }
-
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
-};
-
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+template<typename T>
+MGPU_HOST_DEVICE T* PtrOffset(T* p, ptrdiff_t i) {
+	return (T*)((byte*)p + i);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+// Task range support
+// Evenly distributes variable-length arrays over a fixed number of CTAs.
 
-MGPU_RAND_NS::mt19937 mt19937;
+MGPU_HOST int2 DivideTaskRange(int numItems, int numWorkers) {
+	div_t d = div(numItems, numWorkers);
+	return make_int2(d.quot, d.rem);
+}
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
+MGPU_HOST_DEVICE int2 ComputeTaskRange(int block, int2 task) {
+	int2 range;
+	range.x = task.x * block;
+	range.x += min(block, task.y);
+	range.y = range.x + task.x + (block < task.y);
+	return range;
 }
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
+
+MGPU_HOST_DEVICE int2 ComputeTaskRange(int block, int2 task, int blockSize, 
+	int count) {
+	int2 range = ComputeTaskRange(block, task);
+	range.x *= blockSize;
+	range.y = min(count, range.y * blockSize);
+	return range;
 }
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
+
+////////////////////////////////////////////////////////////////////////////////
+// DeviceExtractHeadFlags
+// Input array flags is a bit array with 32 head flags per word.
+// ExtractThreadHeadFlags returns numBits flags starting at bit index.
+
+MGPU_HOST_DEVICE uint DeviceExtractHeadFlags(const uint* flags, int index, 
+	int numBits) {
+
+	int index2 = index>> 5;
+	int shift = 31 & index;
+	uint headFlags = flags[index2]>> shift;
+	int shifted = 32 - shift;
+
+	if(shifted < numBits)
+		// We also need to shift in the next set of bits.
+		headFlags = bfi(flags[index2 + 1], headFlags, shifted, shift);
+	headFlags &= (1<< numBits) - 1;
+	return headFlags;
 }
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
+
+////////////////////////////////////////////////////////////////////////////////
+// DevicePackHeadFlags
+// Pack VT bits per thread at 32 bits/thread. Will consume an integer number of
+// words, because CTA size is a multiple of 32. The first NT * VT / 32 threads
+// return packed words.
+
+template<int NT, int VT>
+MGPU_DEVICE uint DevicePackHeadFlags(uint threadBits, int tid, 
+	uint* flags_shared) {
+
+	const int WordCount = NT * VT / 32;
+
+	// Each thread stores its thread bits to flags_shared[tid].
+	flags_shared[tid] = threadBits;
+	__syncthreads();
+
+	uint packed = 0;
+	if(tid < WordCount) {
+		const int Items = MGPU_DIV_UP(32, VT);
+		int index = 32 * tid;
+		int first = index / VT;
+		int bit = 0;
+
+		int rem = index - VT * first;
+		packed = flags_shared[first]>> rem;
+		bit = VT - rem;
+		++first;
+		
+		#pragma unroll
+		for(int i = 0; i < Items; ++i) {
+			if(i < Items - 1 || bit < 32) {
+				uint x = flags_shared[first + i];
+				if(bit < 32) packed |= x<< bit;
+				bit += VT;
+			}
+		}
+	}
+	__syncthreads();
+
+	return packed;
 }
 
 } // namespace mgpu

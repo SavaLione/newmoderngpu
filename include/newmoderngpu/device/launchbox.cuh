@@ -61,139 +61,66 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/util/mgpucontext.h>
 
 namespace mgpu {
+	
+#if __CUDA_ARCH__ >= 350
+	#define MGPU_SM_TAG Sm35
+#elif __CUDA_ARCH__ >= 300
+	#define MGPU_SM_TAG Sm30
+#elif __CUDA_ARCH__ >= 200
+	#define MGPU_SM_TAG Sm20
+#else
+	#define MGPU_SM_TAG Sm20
+#endif
 
-////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+#define MGPU_LAUNCH_PARAMS typename Tuning::MGPU_SM_TAG
+#define MGPU_LAUNCH_BOUNDS __global__ \
+	__launch_bounds__(Tuning::MGPU_SM_TAG::NT, Tuning::MGPU_SM_TAG::OCC)
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
-
-	// allocate space.
-	std::string text;
-	text.resize(len);
-
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
-}
-
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
+// Returns (NT, VT) from the sm version.
+template<typename Derived>
+struct LaunchBoxRuntime {
+	static int2 GetLaunchParams(CudaContext& context) {
+		return GetLaunchParams(context.PTXVersion());
 	}
-	return s;
-}
 
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
+	static int2 GetLaunchParams(int sm) {
+		if(sm >= 350) 
+			return make_int2(Derived::Sm35::NT, Derived::Sm35::VT);
+		else if(sm >= 300) 
+			return make_int2(Derived::Sm30::NT, Derived::Sm30::VT);
+		else
+			return make_int2(Derived::Sm20::NT, Derived::Sm20::VT);
 	}
 };
 
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
-}
+// General LaunchBox for any param types.
+template<
+	typename Sm20_, 
+	typename Sm30_ = Sm20_,
+	typename Sm35_ = Sm30_>
+struct LaunchBox : LaunchBoxRuntime<LaunchBox<Sm20_, Sm30_, Sm35_> > {
+	typedef Sm20_ Sm20;
+	typedef Sm30_ Sm30;
+	typedef Sm35_ Sm35;	
+};
 
-////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
-
-MGPU_RAND_NS::mt19937 mt19937;
-
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
-}
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
+// LaunchBox over (NT, VT, NumBlocks)
+template<int NT_, int VT_, int OCC_>
+struct LaunchParamsVT {
+	enum { NT = NT_, VT = VT_, OCC = OCC_ };
+};
+template<
+	int NT_SM20,           int VT_SM20,           int OCC_SM20 = 0,
+	int NT_SM30 = NT_SM20, int VT_SM30 = VT_SM20, int OCC_SM30 = OCC_SM20,
+	int NT_SM35 = NT_SM30, int VT_SM35 = VT_SM30, int OCC_SM35 = OCC_SM30>
+struct LaunchBoxVT : LaunchBox<
+	LaunchParamsVT<NT_SM20, VT_SM20, OCC_SM20>,
+	LaunchParamsVT<NT_SM30, VT_SM30, OCC_SM30>,
+	LaunchParamsVT<NT_SM35, VT_SM35, OCC_SM35> > { };
 
 } // namespace mgpu

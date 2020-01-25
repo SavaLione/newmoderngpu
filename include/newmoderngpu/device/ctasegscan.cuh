@@ -61,139 +61,106 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/device/ctascan.cuh>
 
 namespace mgpu {
 
 ////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// DeviceFindSegScanDelta
+// Runs an inclusive max-index scan over binary inputs.
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
+template<int NT>
+MGPU_DEVICE int DeviceFindSegScanDelta(int tid, bool flag, int* delta_shared) {
+	const int NumWarps = NT / 32;
 
-	// allocate space.
-	std::string text;
-	text.resize(len);
+	int warp = tid / 32;
+	int lane = 31 & tid;
+	uint warpMask = 0xffffffff>> (31 - lane);		// inclusive search
+	uint ctaMask = 0x7fffffff>> (31 - lane);		// exclusive search
 
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
+	uint warpBits = __ballot(flag);
+	delta_shared[warp] = warpBits;
+	__syncthreads();
 
-	return text;
+	if(tid < NumWarps) {
+		uint ctaBits = __ballot(0 != delta_shared[tid]);
+		int warpSegment = 31 - clz(ctaMask & ctaBits);
+		int start = (-1 != warpSegment) ? 
+			(31 - clz(delta_shared[warpSegment]) + 32 * warpSegment) : 0;
+		delta_shared[NumWarps + tid] = start;
+	}
+	__syncthreads();
+
+	// Find the closest flag to the left of this thread within the warp.
+	// Include the flag for this thread.
+	int start = 31 - clz(warpMask & warpBits);
+	if(-1 != start) start += ~31 & tid;
+	else start = delta_shared[NumWarps + warp];
+	__syncthreads();
+
+	return tid - start;
 }
+  
+////////////////////////////////////////////////////////////////////////////////
+// CTASegScan
 
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
-	}
-	return s;
-}
+template<int NT, typename _Op = mgpu::plus<int> >
+struct CTASegScan {
+	typedef _Op Op;
+	typedef typename Op::result_type T;
+	enum { NumWarps = NT / 32, Size = NT, Capacity = 2 * NT };
+	union Storage {
+		int delta[NumWarps];
+		T values[Capacity];
+	};
 
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
+	// Each thread passes the reduction of the LAST SEGMENT that it covers.
+	// flag is set to true if there's at least one segment flag in the thread.
+	// SegScan returns the reduction of values for the first segment in this
+	// thread over the preceding threads.
+	// Return the value init for the first thread.
 
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
+	// When scanning single elements per thread, interpret the flag as a BEGIN
+	// FLAG. If tid's flag is set, its value belongs to thread tid + 1, not 
+	// thread tid.
+
+	// The function returns the reduction of the last segment in the CTA.
+
+	MGPU_DEVICE static T SegScanDelta(int tid, int tidDelta, T x, 
+		Storage& storage, T* carryOut, T identity = (T)0, Op op = Op()) {
+
+		// Run an inclusive scan 
+		int first = 0;
+		storage.values[first + tid] = x;
+		__syncthreads();
+
+		#pragma unroll
+		for(int offset = 1; offset < NT; offset += offset) {
+			if(tidDelta >= offset) 
+				x = op(storage.values[first + tid - offset], x);
+			first = NT - first;
+			storage.values[first + tid] = x;
+			__syncthreads();
+		}
+
+		// Get the exclusive scan.
+		x = tid ? storage.values[first + tid - 1] : identity;
+		*carryOut = storage.values[first + NT - 1];
+		__syncthreads();
+		return x;
 	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
+
+	MGPU_DEVICE static T SegScan(int tid, T x, bool flag, Storage& storage,
+		T* carryOut, T identity = (T)0, Op op = Op()) {
+
+		// Find the left-most thread that covers the first segment of this 
+		// thread.
+		int tidDelta = DeviceFindSegScanDelta<NT>(tid, flag, storage.delta);
+
+		return SegScanDelta(tid, tidDelta, x, storage, carryOut, identity, op);
 	}
 };
-
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
-
-MGPU_RAND_NS::mt19937 mt19937;
-
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
-}
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
 
 } // namespace mgpu

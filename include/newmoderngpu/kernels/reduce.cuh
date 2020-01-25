@@ -61,139 +61,113 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/mgpuhost.cuh>
 
 namespace mgpu {
 
 ////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// KernelReduce
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
+template<typename Tuning, typename InputIt, typename T, typename Op>
+MGPU_LAUNCH_BOUNDS void KernelReduce(InputIt data_global, int count, 
+	T identity, Op op, T* reduction_global) {
 
-	// allocate space.
-	std::string text;
-	text.resize(len);
+	typedef MGPU_LAUNCH_PARAMS Params;
+	const int NT = Params::NT;
+	const int VT = Params::VT;
+	const int NV = NT * VT;
+	typedef CTAReduce<NT, Op> R;
 
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
+	union Shared {
+		typename R::Storage reduceStorage;
+	};
+	__shared__ Shared shared;
 
-	return text;
-}
+	int tid = threadIdx.x;
+	int block = blockIdx.x;
+	int gid = NV * block;
+	int count2 = min(NV, count - gid);
 
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
-	}
-	return s;
-}
+	// Load a full tile into register in strided order. Set out-of-range values
+	// with identity.
+	T data[VT];
+	DeviceGlobalToRegDefault<NT, VT>(count2, data_global + gid, tid, data,
+		identity);
 
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
+	// Sum elements within each thread.
+	T x;
+	#pragma unroll
+	for(int i = 0; i < VT; ++i)
+		x = i ? op(x, data[i]) : data[i];
 
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
-};
+	// Sum thread-totals over the CTA.
+	x = R::Reduce(tid, x, shared.reduceStorage, op);
 
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+	// Store the tile's reduction to global memory.
+	if(!tid)
+		reduction_global[block] = x;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+// Reduce
 
-MGPU_RAND_NS::mt19937 mt19937;
+template<typename InputIt, typename T, typename Op>
+MGPU_HOST void Reduce(InputIt data_global, int count, T identity, Op op,
+	T* reduce_global, T* reduce_host, CudaContext& context) {
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
+	MGPU_MEM(T) totalDevice;
+	if(!reduce_global) {
+		totalDevice = context.Malloc<T>(1);
+		reduce_global = totalDevice->get();
+	}
+
+	if(count <= 256) {
+		typedef LaunchBoxVT<256, 1> Tuning;
+		KernelReduce<Tuning><<<1, 256, 0, context.Stream()>>>(
+			data_global, count, identity, op, reduce_global);
+		MGPU_SYNC_CHECK("KernelReduce");
+
+	} else if(count <= 768) {
+		typedef LaunchBoxVT<256, 3> Tuning;
+		KernelReduce<Tuning><<<1, 256, 0, context.Stream()>>>(
+			data_global, count, identity, op, reduce_global);
+		MGPU_SYNC_CHECK("KernelReduce");
+
+	} else if(count <= 512 * ((sizeof(T) > 4) ? 4 : 8)) {
+		typedef LaunchBoxVT<512, (sizeof(T) > 4) ? 4 : 8> Tuning;
+		KernelReduce<Tuning><<<1, 512, 0, context.Stream()>>>(
+			data_global, count, identity, op, reduce_global);
+		MGPU_SYNC_CHECK("KernelReduce");
+
+	} else {
+		// Launch a grid and reduce tiles to temporary storage.
+		typedef LaunchBoxVT<256, (sizeof(T) > 4) ? 8 : 16> Tuning;
+		int2 launch = Tuning::GetLaunchParams(context);
+		int NV = launch.x * launch.y;
+		int numBlocks = MGPU_DIV_UP(count, NV);
+
+		MGPU_MEM(T) reduceDevice = context.Malloc<T>(numBlocks);
+		KernelReduce<Tuning><<<numBlocks, launch.x, 0, context.Stream()>>>(
+			data_global, count, identity, op, reduceDevice->get());
+		MGPU_SYNC_CHECK("KernelReduce");
+
+		Reduce(reduceDevice->get(), numBlocks, identity, op, reduce_global,
+			(T*)0, context);
+	}
+
+	if(reduce_host)
+		copyDtoH(reduce_host, reduce_global, 1);
 }
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
+
+template<typename InputIt>
+MGPU_HOST typename std::iterator_traits<InputIt>::value_type
+Reduce(InputIt data_global, int count, CudaContext& context) { 
+	typedef typename std::iterator_traits<InputIt>::value_type T;
+	T result;
+	Reduce(data_global, count, (T)0, mgpu::plus<T>(), (T*)0, &result, context);
+	return result;
 }
 
 } // namespace mgpu

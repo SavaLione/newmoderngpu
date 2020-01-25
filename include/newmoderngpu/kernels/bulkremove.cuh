@@ -61,139 +61,119 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/mgpuhost.cuh>
+#include <newmoderngpu/kernels/search.cuh>
 
 namespace mgpu {
 
 ////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// KernelBulkRemove
+// Copy the values that are not matched by an index. This is like the 
+// anti-gather.
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
+template<typename Tuning, typename InputIt, typename IndicesIt, 
+	typename OutputIt>
+MGPU_LAUNCH_BOUNDS void KernelBulkRemove(InputIt source_global, int sourceCount, 
+	IndicesIt indices_global, int indicesCount, const int* p_global,
+	OutputIt dest_global) {
 
-	// allocate space.
-	std::string text;
-	text.resize(len);
+	typedef MGPU_LAUNCH_PARAMS Params;
+	typedef typename std::iterator_traits<InputIt>::value_type T;
+	const int NT = Params::NT;
+	const int VT = Params::VT;
+	const int NV = NT * VT;
 
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
+	typedef CTAScan<NT> S;
+	union Shared {
+		int indices[NV];
+		typename S::Storage scan;
+	};
+	__shared__ Shared shared;
 
-	return text;
-}
+	int tid = threadIdx.x;
+	int block = blockIdx.x;
+	int gid = block * NV;
+	sourceCount = min(NV, sourceCount - gid);
 
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
+	// Search for begin and end iterators of interval to load.
+	int p0 = p_global[block];
+	int p1 = p_global[block + 1];
+
+	// Set the flags to 1. The default is to copy a value.
+	#pragma unroll
+	for(int i = 0; i < VT; ++i) {
+		int index = NT * i + tid;
+		shared.indices[index] = index < sourceCount;
 	}
-	return s;
-}
+	__syncthreads();
 
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
+	// Load the indices into register.
+	int begin = p0;
+	int indexCount = p1 - begin;
+	int indices[VT];
+	DeviceGlobalToReg<NT, VT>(indexCount, indices_global + begin, tid, indices);
 
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
-};
+	// Set the counter to 0 for each index we've loaded.
+	#pragma unroll
+	for(int i = 0; i < VT; ++i)
+		if(NT * i + tid < indexCount) 
+			shared.indices[indices[i] - gid] = 0;
+	__syncthreads();
 
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+	// Run a raking scan over the flags. We count the set flags - this is the 
+	// number of elements to load in per thread.
+	int x = 0;
+	#pragma unroll
+	for(int i = 0; i < VT; ++i)
+		x += indices[i] = shared.indices[VT * tid + i];
+	__syncthreads();
+
+	// Run a CTA scan and scatter the gather indices to shared memory.
+	int scan = S::Scan(tid, x, shared.scan);
+	#pragma unroll
+	for(int i = 0; i < VT; ++i)
+		if(indices[i]) shared.indices[scan++] = VT * tid + i;
+	__syncthreads();
+
+	// Load the gather indices into register.
+	DeviceSharedToReg<NT, VT>(shared.indices, tid, indices);
+
+	// Gather the data into register. The number of values to copy is 
+	// sourceCount - indexCount.
+	source_global += gid;
+	int count = sourceCount - indexCount;
+	T values[VT];
+	DeviceGather<NT, VT>(count, source_global, indices, tid, values, false);
+
+	// Store all the valid registers to dest_global.
+	DeviceRegToGlobal<NT, VT>(count, values, tid, dest_global + gid - begin);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+// BulkRemove 
 
-MGPU_RAND_NS::mt19937 mt19937;
+template<typename InputIt, typename IndicesIt, typename OutputIt>
+MGPU_HOST void BulkRemove(InputIt source_global, int sourceCount,
+	IndicesIt indices_global, int indicesCount, OutputIt dest_global,
+	CudaContext& context) {
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
-}
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
+	const int NT = 128;
+	const int VT = 11;
+	typedef LaunchBoxVT<NT, VT> Tuning;
+	int2 launch = Tuning::GetLaunchParams(context);
+	const int NV = launch.x * launch.y;
+
+	MGPU_MEM(int) partitionsDevice = BinarySearchPartitions<MgpuBoundsLower>(
+		sourceCount, indices_global, indicesCount, NV, mgpu::less<int>(), 
+		context);
+
+	int numBlocks = MGPU_DIV_UP(sourceCount, NV);
+	KernelBulkRemove<Tuning><<<numBlocks, launch.x, 0, context.Stream()>>>(
+		source_global, sourceCount, indices_global, indicesCount, 
+		partitionsDevice->get(), dest_global);
+	MGPU_SYNC_CHECK("KernelBulkRemove");
 }
 
 } // namespace mgpu

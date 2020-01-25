@@ -61,139 +61,105 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/device/ctasearch.cuh>
+#include <newmoderngpu/device/loadstore.cuh>
 
 namespace mgpu {
 
 ////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// DeviceLoadBalancingSearch
+// Upper Bound search from A (needles) into B (haystack). The A values are 
+// natural numbers from aBegin to aEnd. bFirst is the index of the B value at
+// bBegin in shared memory.
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
+template<int VT, bool RangeCheck>
+MGPU_DEVICE void DeviceSerialLoadBalanceSearch(const int* b_shared, int aBegin,
+	int aEnd, int bFirst, int bBegin, int bEnd, int* a_shared) {
 
-	// allocate space.
-	std::string text;
-	text.resize(len);
+	int bKey = b_shared[bBegin];
 
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
-}
-
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
+	#pragma unroll
+	for(int i = 0; i < VT; ++i) {
+		bool p;
+		if(RangeCheck) 
+			p = (aBegin < aEnd) && ((bBegin >= bEnd) || (aBegin < bKey));
 		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
+			p = aBegin < bKey;
+
+		if(p)
+			// Advance A (the needle).
+			a_shared[aBegin++] = bFirst + bBegin;
 		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
+			// Advance B (the haystack).
+			bKey = b_shared[++bBegin];
 	}
-	return s;
-}
-
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
-};
-
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+// CTALoadBalance
+// Computes upper_bound(counting_iterator<int>(first), b_global) - 1.
 
-MGPU_RAND_NS::mt19937 mt19937;
+// Unlike most other CTA* functions, CTALoadBalance loads from global memory.
+// This returns the loaded B elements at the beginning or end of shared memory
+// depending on the aFirst argument. 
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
+// CTALoadBalance requires NT * VT + 2 slots of shared memory.
+template<int NT, int VT, typename InputIt>
+MGPU_DEVICE int4 CTALoadBalance(int destCount, InputIt b_global, 
+	int sourceCount, int block, int tid, const int* mp_global, 
+	int* indices_shared, bool loadPrecedingB) {
+		    
+	int4 range = ComputeMergeRange(destCount, sourceCount, block, 0, NT * VT, 
+		mp_global);
+
+	int a0 = range.x;
+	int a1 = range.y;
+	int b0 = range.z;
+	int b1 = range.w;
+	if(!b0) loadPrecedingB = false;
+
+	// Load one trailing term from B. If we're already at the end, fill the 
+	// end of the buffer with destCount.
+	int aCount = a1 - a0;
+	int bCount = b1 - b0;
+	int extended = b1 < sourceCount;
+	int loadCount = bCount + extended;
+	int fillCount = NT * VT + 1 - loadCount - aCount;
+
+	int* a_shared = indices_shared;
+	int* b_shared = indices_shared + aCount + (int)loadPrecedingB;
+
+	// Load the B values.
+//	DeviceMemToMemLoop<NT>(bCount + extended + (int)loadPrecedingB, 
+//		b_global + b0 - (int)loadPrecedingB, tid, 
+//		b_shared - (int)loadPrecedingB);
+
+	for(int i = tid - (int)loadPrecedingB; i < bCount + extended; i += NT)
+		b_shared[i] = b_global[b0 + i];
+
+	// Fill the end of the array with destCount.
+	for(int i = tid + extended; i < fillCount; i += NT)
+		b_shared[bCount + i] = destCount;
+	__syncthreads();
+
+	// Run a merge path to find the start of the serial merge for each thread.
+	int diag = VT * tid;
+	int mp = MergePath<MgpuBoundsUpper>(mgpu::counting_iterator<int>(a0),
+		aCount, b_shared, bCount, diag, mgpu::less<int>());
+
+	int a0tid = a0 + mp;
+	int b0tid = diag - mp;
+	
+	// Subtract 1 from b0 because we want to return upper_bound - 1.
+	DeviceSerialLoadBalanceSearch<VT, false>(b_shared, a0tid, a1, b0 - 1,
+		b0tid, bCount, a_shared - a0);
+	__syncthreads();
+	
+	b0 -= (int)loadPrecedingB;
+	return make_int4(a0, a1, b0, b1);
 }
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
+
 
 } // namespace mgpu

@@ -61,139 +61,117 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/util/static.h>
+#include <vector>
+#include <cstdio>
+#include <algorithm>
+#include <string>
 
 namespace mgpu {
 
-////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// Like sprintf but dynamically allocates sufficient output to hold the entire
+// text.
+std::string stringprintf(const char* format, ...);
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
+// Returns xxx.xx(K|M|B)
+std::string FormatInteger(int64 x);
 
-	// allocate space.
-	std::string text;
-	text.resize(len);
+const char* TypeIdString(const std::type_info& ti);
 
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
+template<typename T>
+const char* TypeIdName() {
+	return TypeIdString(typeid(T));
 }
 
-std::string FormatInteger(int64 x) {
+struct FormatOpPrintf {
+	const char* format;
+	FormatOpPrintf(const char* f) : format(f) { }
+
+	template<typename T>
+	std::string operator()(int index, T x) const {
+		return stringprintf(format, x);
+	}
+};
+
+struct FormatOpMaskBit {
+	const char* format;
+	FormatOpMaskBit(const char* f) : format(f) { }
+
+	std::string operator()(int index, int x) const {
+		return stringprintf(format, (0x80000000 & x) ? '*' : ' ', 
+			0x7fffffff & x);
+	}
+};
+
+struct FormatOpMarkArray {
+	const char* format;
+	const int* marks;
+	int numMarks;
+
+	FormatOpMarkArray(const char* f, const int* m, int n) :
+		format(f), marks(m), numMarks(n) { }
+
+	std::string operator()(int index, int x) const {
+		// Search for index in the array of marks.
+		bool mark = std::binary_search(marks, marks + numMarks, index);
+		return stringprintf(format, mark ? '*' : ' ', x);
+	}
+};
+
+template<typename T, typename Op>
+std::string FormatArrayOp(const T* data, size_t count, Op op, int numCols) {
 	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
+	size_t numRows = MGPU_DIV_UP(count, numCols);
+	for(size_t row(0); row < numRows; ++row) { 
+		size_t left = row * numCols;
+		s.append(stringprintf("%5d:  ", left));
+
+		for(size_t col(left); col < std::min(left + numCols, count); ++col) {
+			s.append(op(col, data[col]));
+			s.push_back(' ');
+		}
+		s.push_back('\n');
 	}
 	return s;
 }
 
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
-};
-
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+template<typename T>
+std::string FormatArray(const T* data, size_t count, const char* format, 
+	int numCols) {
+	return FormatArrayOp(data, count, FormatOpPrintf(format), numCols);
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+template<typename T>
+std::string FormatArray(const std::vector<T>& data, const char* format, 
+	int numCols) {
+	return FormatArray(&data[0], (int)data.size(), format, numCols);
+}
+template<typename T, typename Op>
+std::string FormatArrayOp(const std::vector<T>& data, Op op, int numCols) {
+	return FormatArrayOp(&data[0], (int)data.size(), op, numCols);
+}
 
-MGPU_RAND_NS::mt19937 mt19937;
+template<typename T>
+void PrintArray(const T* data, size_t count, const char* format, int numCols) {
+	std::string s = FormatArray(data, count, format, numCols);
+	printf("%s", s.c_str());
+}
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
+template<typename T>
+void PrintArray(const std::vector<T>& data, const char* format, int numCols) {
+	std::string s = FormatArray(data, format, numCols);
+	printf("%s", s.c_str());
 }
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
+
+template<typename T, typename Op>
+void PrintArrayOp(const std::vector<T>& data, Op op, int numCols) {
+	std::string s = FormatArrayOp(data, op, numCols);
+	printf("%s", s.c_str());
 }
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
+
+
+
 
 } // namespace mgpu

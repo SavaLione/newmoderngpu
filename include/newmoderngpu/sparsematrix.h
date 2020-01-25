@@ -61,139 +61,93 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/util/static.h>
 
 namespace mgpu {
 
-////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
-
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
-
-	// allocate space.
-	std::string text;
-	text.resize(len);
-
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
-}
-
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
-	}
-	return s;
-}
-
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
+struct SparseMatrix {
+	int height, width, nz;
+	std::vector<int> csr;				// height
+	std::vector<int> cols;				// nz
+	std::vector<double> matrix;			// nz
 };
 
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+bool ReadSparseMatrix(FILE* f, std::auto_ptr<SparseMatrix>* ppMatrix,
+	std::string& err);
+
+bool ReadSparseMatrix(const char* filename,
+	std::auto_ptr<SparseMatrix>* ppMatrix, std::string& err);
+
+bool LoadBinaryMatrix(const char* filename,
+	std::auto_ptr<SparseMatrix>* ppMatrix);
+
+bool StoreBinaryMatrix(const char* filename, const SparseMatrix& matrix);
+
+bool LoadCachedMatrix(const char* filename, 
+	std::auto_ptr<SparseMatrix>* ppMatrix, std::string& err);
+
+// Multiply the matrix by a vector of 1s.
+template<typename T>
+void SpmvTest(const SparseMatrix& m, T* results) {
+	memset(results, 0, sizeof(T) * m.height);
+	for(int row = 0; row < m.height; ++row) {
+		T product = 0;
+		int begin = m.csr[row];
+		int end = (row + 1 < m.height) ? m.csr[row + 1] : m.nz;
+		for(int i = begin; i < end; ++i)
+			product += (T)m.matrix[i];
+
+		results[row] = product;
+	}		
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+template<typename T>
+void CompareVecs(const T* test, const T* ref, int count) {
+	for(int i = 0; i < count; ++i) {
+		double x = ref[i];
+		double y = test[i];
+		double diff = fabs(x - y);
 
-MGPU_RAND_NS::mt19937 mt19937;
+		if(diff > 1.0e-5) {
+			if(y > 0) {
+				if(1.01 * x < y || 0.99 * x > y) {
+					printf("BAD OUTPUT AT COMPONENT %d: %8.5e vs %8.5e\n", i,
+						x, y);
+				//	exit(0);
+					return;
+				}
+			} else {
+				if(1.01 * x > y || 0.99 * x < y) {
+					printf("BAD OUTPUT AT COMPONENT %d: %8.5e vs %8.5e\n", i, 
+						x, y);
+				//	exit(0);
+					return;
+				}
+			}
+		}
+	}
+}
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
-}
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
+struct MatrixStats {
+	int height, width, nz;
+	
+	// Row density moments:
+	double mean;
+	double stddev;
+	double skewness;
+};
+
+MatrixStats ComputeMatrixStats(const SparseMatrix& m);
+
+int64 MulSparseMatrices(const SparseMatrix& A, const SparseMatrix& B,
+	std::auto_ptr<SparseMatrix>* ppC);
+
+
+int64 ComputeProductCount(const SparseMatrix& A, const SparseMatrix& B);
+
+void ComputeColRanges(const SparseMatrix& A, const SparseMatrix& B,
+	int* colMin, int* colMax);
 
 } // namespace mgpu

@@ -61,139 +61,93 @@
  *
  ******************************************************************************/
 
-#include <newmoderngpu/util/format.h>
-#include <vector_types.h>
-#include <cstdarg>
-#include <map>
+#pragma once
 
-#define MGPU_RAND_NS std::tr1
-
-#ifdef _MSC_VER
-#include <random>
-#else
-#include <tr1/random>
-#endif
+#include <newmoderngpu/util/static.h>
 
 namespace mgpu {
 
+extern int Rand(int min, int max);
+extern int64 Rand(int64 min, int64 max);
+extern uint Rand(uint min, uint max);
+extern uint64 Rand(uint64 min, uint64 max);
+extern float Rand(float min, float max);
+extern double Rand(double min, double max);
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// String formatting utilities.
+// intrusive_ptr
 
-std::string stringprintf(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(0, 0, format, args);
-	va_end(args);
-
-	// allocate space.
-	std::string text;
-	text.resize(len);
-
-	va_start(args, format);
-	vsnprintf(&text[0], len + 1, format, args);
-	va_end(args);
-
-	return text;
-}
-
-std::string FormatInteger(int64 x) {
-	std::string s;
-	if(x < 1000)
-		s = stringprintf("%6d", (int)x);
-	else if(x < 1000000) {
-		if(0 == (x % 1000))
-			s = stringprintf("%5dK", (int)(x / 1000));
-		else
-			s = stringprintf("%5.1lfK", x / 1.0e3);
-	} else if(x < 1000000000ll) {
-		if(0 == (x % 1000000ll))
-			s = stringprintf("%5dM", (int)(x / 1000000));
-		else
-			s = stringprintf("%5.1lfM", x / 1.0e6);
-	} else {
-		if(0 == (x % 1000000000ll))
-			s = stringprintf("%5dB", (int)(x / 1000000000ll));
-		else
-			s = stringprintf("%5.1lfB", x / 1.0e9);
-	}
-	return s;
-}
-
-class TypeIdMap {
-	typedef std::map<std::string, const char*> Map;
-	Map _map;
-
-	void Insert(const std::type_info& ti, const char* name) {
-		_map[ti.name()] = name;
-	}
-public:
-	TypeIdMap() {
-		Insert(typeid(char), "char");
-		Insert(typeid(byte), "byte");
-		Insert(typeid(short), "short");
-		Insert(typeid(ushort), "ushort");
-		Insert(typeid(int), "int");
-		Insert(typeid(int64), "int64");
-		Insert(typeid(uint), "uint");
-		Insert(typeid(uint64), "uint64");
-		Insert(typeid(float), "float");
-		Insert(typeid(double), "double");
-		Insert(typeid(int2), "int2");
-		Insert(typeid(int3), "int3");
-		Insert(typeid(int4), "int4");
-		Insert(typeid(uint2), "uint2");
-		Insert(typeid(uint3), "uint3");
-		Insert(typeid(uint4), "uint4");
-		Insert(typeid(float2), "float2");
-		Insert(typeid(float3), "float3");
-		Insert(typeid(float4), "float4");
-		Insert(typeid(double2), "double2");
-		Insert(typeid(double3), "double3");
-		Insert(typeid(double4), "double4");
-		Insert(typeid(char*), "char*");
-	}
-	const char* name(const std::type_info& ti) {
-		const char* n = ti.name();
-		Map::iterator it = _map.find(n);
-		if(it != _map.end()) 
-			n = it->second;
-		return n;
-	}
+// boost::noncopyable, moved here so we don't have dependency on boost
+class noncopyable {
+protected:
+	noncopyable() {}
+	~noncopyable() {}
+private:
+	noncopyable(const noncopyable&) { }
+	const noncopyable& operator=(const noncopyable&) { return *this; }
 };
 
-const char* TypeIdString(const std::type_info& ti) {
-	static TypeIdMap typeIdMap;
-	return typeIdMap.name(ti);
+class CudaBase : public noncopyable {
+public:
+	CudaBase() : _ref(0) { }
+	virtual ~CudaBase() { }
+	virtual long AddRef() {
+	//	return BOOST_INTERLOCKED_INCREMENT(&_ref);
+		return ++_ref;
+	}
+	virtual void Release() {
+	//	if(!BOOST_INTERLOCKED_DECREMENT(&_ref)) delete this;
+		if(!--_ref) delete this;		
+	}
+private:
+	long _ref;
+};
+
+inline long intrusive_ptr_add_ref(CudaBase* base) {
+	return base->AddRef();
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Random number generators.
+inline void intrusive_ptr_release(CudaBase* base) {
+	base->Release();
+}
 
-MGPU_RAND_NS::mt19937 mt19937;
+template<typename T>
+class intrusive_ptr {
+public:
+	intrusive_ptr() : _p(0) { }
+	explicit intrusive_ptr(T* p) : _p(p) {
+		if(p) intrusive_ptr_add_ref(p);
+	}
+	intrusive_ptr(const intrusive_ptr<T>& rhs) : _p(rhs._p) {
+		if(_p) intrusive_ptr_add_ref(_p);
+	}
+	~intrusive_ptr() {
+		if(_p) intrusive_ptr_release(_p);
+	}
+	intrusive_ptr& operator=(const intrusive_ptr& rhs) {
+		intrusive_ptr(rhs.get()).swap(*this);
+		return *this;
+	}
 
-int Rand(int min, int max) {
-	MGPU_RAND_NS::uniform_int<int> r(min, max);
-	return r(mt19937);
-}
-int64 Rand(int64 min, int64 max) {
-	MGPU_RAND_NS::uniform_int<int64> r(min, max);
-	return r(mt19937);
-}
-uint Rand(uint min, uint max) {
-	MGPU_RAND_NS::uniform_int<uint> r(min, max);
-	return r(mt19937);
-}
-uint64 Rand(uint64 min, uint64 max) {
-	MGPU_RAND_NS::uniform_int<uint64> r(min, max);
-	return r(mt19937);
-}
-float Rand(float min, float max) {
-	MGPU_RAND_NS::uniform_real<float> r(min, max);
-	return r(mt19937);
-}
-double Rand(double min, double max) {
-	MGPU_RAND_NS::uniform_real<double> r(min, max);
-	return r(mt19937);
-}
+	void reset(T* p = 0) {
+		intrusive_ptr(p).swap(*this);
+	}
+	T* release() {
+		T* p = _p;
+		_p = 0;
+		return p;
+	}
+
+	T* get() const { return _p; }
+	operator T*() const { return _p; }
+	T* operator->() const { return _p; }
+	
+	void swap(intrusive_ptr& rhs) {
+		std::swap(_p, rhs._p);
+	}
+private:
+	T* _p;
+};
 
 } // namespace mgpu
